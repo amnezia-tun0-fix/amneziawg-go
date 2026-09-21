@@ -9,7 +9,8 @@
 // lives outside this package and is injected via Set as a PacketFilter — on
 // Android it bridges through JNI to ConnectivityManager.getConnectionOwnerUid.
 // Because this datapath is packet-based (the filter would otherwise be consulted
-// for every packet), decisions are cached per flow (proto+srcIP+srcPort) so the
+// for every packet), a TCP flow is judged only on packets that open a connection
+// (SYN set), and decisions are cached per flow (proto+srcIP+srcPort) so the
 // expensive cross-language call happens at most once per new flow.
 //
 // When no filter is installed (the default), AllowOutboundPacket returns true
@@ -57,8 +58,11 @@ func Get() PacketFilter {
 // AllowOutboundPacket parses the 5-tuple from an outbound IP packet and returns
 // whether it may be sent. It returns true when no filter is installed, and when
 // the packet is not TCP/UDP (protocols without ports can't be UID-resolved and
-// are passed through). Cached per flow so the filter is consulted at most once
-// per (proto,srcIP,srcPort).
+// are passed through). TCP packets without SYN are passed through as well: a
+// connection whose SYN was denied never becomes established, so any later packet
+// belongs to an allowed one. Judging those again would misread closing sockets,
+// which the kernel re-attributes to UID 0 once the app has closed them. Cached
+// per flow so the filter is consulted at most once per (proto,srcIP,srcPort).
 func AllowOutboundPacket(packet []byte) bool {
 	f := Get()
 	if f == nil {
@@ -68,6 +72,11 @@ func AllowOutboundPacket(packet []byte) bool {
 	network, src, srcPort, dst, dstPort, ok := parse5Tuple(packet)
 	if !ok {
 		return true
+	}
+	if network == protoTCP {
+		if flags, ok := tcpFlags(packet); ok && flags&tcpFlagSYN == 0 {
+			return true
+		}
 	}
 
 	key := flowKey{proto: network}
@@ -88,6 +97,9 @@ const (
 
 	ipProtoTCP = 6
 	ipProtoUDP = 17
+
+	tcpOffsetFlags = 13
+	tcpFlagSYN     = 0x02
 
 	// IP-header field offsets (bytes from the start of the IP packet).
 	ipv4OffsetSrc = 12
@@ -137,6 +149,19 @@ func parse5Tuple(p []byte) (network string, srcIP net.IP, srcPort int, dstIP net
 		return network, srcIP, srcPort, dstIP, dstPort, true
 	}
 	return
+}
+
+// tcpFlags returns the flags byte of a TCP packet already accepted by
+// parse5Tuple. ok is false when the header is too short to hold it.
+func tcpFlags(p []byte) (flags byte, ok bool) {
+	l4 := 40
+	if p[0]>>4 == 4 {
+		l4 = int(p[0]&0x0f) * 4
+	}
+	if len(p) < l4+tcpOffsetFlags+1 {
+		return 0, false
+	}
+	return p[l4+tcpOffsetFlags], true
 }
 
 func ipProtoToNetwork(proto byte) (string, bool) {

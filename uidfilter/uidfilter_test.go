@@ -19,6 +19,14 @@ func ipv4Packet(proto byte, src, dst net.IP, srcPort, dstPort int) []byte {
 	return p
 }
 
+// tcpPacket builds a minimal IPv4 TCP packet carrying the given flags.
+func tcpPacket(srcPort int, flags byte) []byte {
+	p := ipv4Packet(ipProtoTCP, net.IPv4(10, 0, 0, 2), net.IPv4(1, 1, 1, 1), srcPort, 443)
+	p = append(p, make([]byte, 16)...) // rest of the 20-byte TCP header
+	p[20+tcpOffsetFlags] = flags
+	return p
+}
+
 // countingFilter denies a specific source port and records call count.
 type countingFilter struct {
 	denySrcPort int
@@ -86,5 +94,32 @@ func TestNonTCPUDPPassesThrough(t *testing.T) {
 	icmp := ipv4Packet(1, net.IPv4(10, 0, 0, 2), net.IPv4(1, 1, 1, 1), 0, 0)
 	if !AllowOutboundPacket(icmp) {
 		t.Error("non-TCP/UDP packets should pass through")
+	}
+}
+
+func TestTCPJudgedOnlyOnSYN(t *testing.T) {
+	f := &countingFilter{denySrcPort: 4444}
+	Set(f)
+	t.Cleanup(func() { Set(nil) })
+
+	const ack, fin, synAck = 0x10, 0x11, 0x12
+	// Packets of an established or closing connection are not judged, even on a
+	// denied port: its SYN already passed, or the connection never existed.
+	for _, flags := range []byte{ack, fin} {
+		if !AllowOutboundPacket(tcpPacket(4444, flags)) {
+			t.Errorf("flags %#x: expected pass-through without SYN", flags)
+		}
+	}
+	if f.calls != 0 {
+		t.Errorf("expected no filter calls without SYN, got %d", f.calls)
+	}
+	if AllowOutboundPacket(tcpPacket(4444, tcpFlagSYN)) {
+		t.Error("expected deny for SYN on blocked source port")
+	}
+	if AllowOutboundPacket(tcpPacket(4444, synAck)) {
+		t.Error("expected deny for SYN-ACK on blocked source port (cached)")
+	}
+	if !AllowOutboundPacket(tcpPacket(5555, tcpFlagSYN)) {
+		t.Error("expected allow for SYN on unblocked source port")
 	}
 }
