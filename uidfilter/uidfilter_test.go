@@ -40,10 +40,10 @@ func (f *countingFilter) Allow(network, srcIP string, srcPort int, dstIP string,
 
 func TestParse5TupleTCP(t *testing.T) {
 	p := ipv4Packet(ipProtoTCP, net.IPv4(10, 0, 0, 2), net.IPv4(1, 1, 1, 1), 54321, 443)
-	network, src, srcPort, dst, dstPort, ok := parse5Tuple(p)
-	if !ok || network != "tcp" || src.String() != "10.0.0.2" || srcPort != 54321 ||
+	proto, src, srcPort, dst, dstPort, ok := parse5Tuple(p)
+	if !ok || proto != ipProtoTCP || src.String() != "10.0.0.2" || srcPort != 54321 ||
 		dst.String() != "1.1.1.1" || dstPort != 443 {
-		t.Fatalf("bad parse: %v %v %d %v %d ok=%v", network, src, srcPort, dst, dstPort, ok)
+		t.Fatalf("bad parse: %d %v %d %v %d ok=%v", proto, src, srcPort, dst, dstPort, ok)
 	}
 }
 
@@ -131,5 +131,49 @@ func TestTCPJudgedOnlyOnSYN(t *testing.T) {
 	}
 	if !AllowOutboundPacket(tcpPacket(5555, tcpFlagSYN)) {
 		t.Error("expected allow for SYN on unblocked source port")
+	}
+}
+
+// --- benchmarks: the cost the hook adds per packet ---
+
+func benchPacket() []byte { return tcpPacket(5555, 0x10) } // an established-connection ACK
+
+// The disabled path: what every non-Android build would pay if it were not
+// compiled out, and what an Android build pays with the feature off.
+func BenchmarkAllowOutboundPacketNoFilter(b *testing.B) {
+	Set(nil)
+	p := benchPacket()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !AllowOutboundPacket(p) {
+			b.Fatal("unexpected deny")
+		}
+	}
+}
+
+// The common case with the feature on: a packet of a connection already judged.
+func BenchmarkAllowOutboundPacketEstablishedTCP(b *testing.B) {
+	Set(&countingFilter{denySrcPort: -1})
+	b.Cleanup(func() { Set(nil) })
+	p := benchPacket()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !AllowOutboundPacket(p) {
+			b.Fatal("unexpected deny")
+		}
+	}
+}
+
+// A UDP packet of a flow whose verdict is cached: parse plus a cache hit.
+func BenchmarkAllowOutboundPacketCachedUDP(b *testing.B) {
+	Set(&countingFilter{denySrcPort: -1})
+	b.Cleanup(func() { Set(nil) })
+	p := ipv4Packet(ipProtoUDP, net.IPv4(10, 0, 0, 2), net.IPv4(1, 1, 1, 1), 5555, 443)
+	AllowOutboundPacket(p)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !AllowOutboundPacket(p) {
+			b.Fatal("unexpected deny")
+		}
 	}
 }

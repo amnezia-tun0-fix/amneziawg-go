@@ -345,10 +345,12 @@ func (device *Device) RoutineReadFromTUN() {
 
 			// Strict Split Tunneling: drop outbound packets whose owning app is
 			// disallowed by the split-tunnel policy (issue amnezia-client#2457),
-			// so a bypassing app can't leak into the tunnel. No-op (and no
-			// per-packet parsing) when the filter is off. Dropping here mirrors
-			// the peer==nil path below: the element is reused for the next read.
-			if !uidfilter.AllowOutboundPacket(elem.packet) {
+			// so a bypassing app can't leak into the tunnel. uidfilter.Supported
+			// is false off Android, so this branch and the call compile away
+			// there; on Android with no filter installed it is one atomic load.
+			// Dropping here mirrors the peer==nil path below: the element is
+			// reused for the next read.
+			if uidfilter.Supported && !uidfilter.AllowOutboundPacket(elem.packet) {
 				continue
 			}
 
