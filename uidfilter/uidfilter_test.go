@@ -88,12 +88,22 @@ func TestAllowDenyAndCache(t *testing.T) {
 	}
 }
 
-func TestNonTCPUDPPassesThrough(t *testing.T) {
+func TestUnresolvablePacketsDroppedWhileFiltering(t *testing.T) {
 	Set(&countingFilter{denySrcPort: -1})
 	t.Cleanup(func() { Set(nil) })
+	// ICMP echo can be sent from an unprivileged ping socket bound to tun0.
 	icmp := ipv4Packet(1, net.IPv4(10, 0, 0, 2), net.IPv4(1, 1, 1, 1), 0, 0)
+	if AllowOutboundPacket(icmp) {
+		t.Error("ICMP must be dropped while a filter is installed")
+	}
+	frag := ipv4Packet(ipProtoUDP, net.IPv4(10, 0, 0, 2), net.IPv4(1, 1, 1, 1), 5555, 443)
+	frag[6] = 0x20 // more fragments
+	if AllowOutboundPacket(frag) {
+		t.Error("IPv4 fragments must be dropped while a filter is installed")
+	}
+	Set(nil)
 	if !AllowOutboundPacket(icmp) {
-		t.Error("non-TCP/UDP packets should pass through")
+		t.Error("ICMP must pass when no filter is installed")
 	}
 }
 

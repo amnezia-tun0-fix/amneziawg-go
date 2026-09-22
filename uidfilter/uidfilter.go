@@ -13,6 +13,12 @@
 // (SYN set), and decisions are cached per flow (proto+srcIP+srcPort) so the
 // expensive cross-language call happens at most once per new flow.
 //
+// While a filter is installed, packets whose owner cannot be resolved are
+// dropped: anything but TCP and UDP, IP fragments, and IPv6 packets with
+// extension headers. An unprivileged app can send ICMP echo through a ping
+// socket bound to the tun device, and the platform resolves owners for TCP and
+// UDP only, so passing such packets would reopen the bypass.
+//
 // When no filter is installed (the default), AllowOutboundPacket returns true
 // immediately, so legacy behavior has essentially zero per-packet cost.
 package uidfilter
@@ -56,9 +62,9 @@ func Get() PacketFilter {
 }
 
 // AllowOutboundPacket parses the 5-tuple from an outbound IP packet and returns
-// whether it may be sent. It returns true when no filter is installed, and when
-// the packet is not TCP/UDP (protocols without ports can't be UID-resolved and
-// are passed through). TCP packets without SYN are passed through as well: a
+// whether it may be sent. It returns true when no filter is installed, and false
+// for a packet whose owner cannot be resolved (see the package comment). TCP
+// packets without SYN are passed through: a
 // connection whose SYN was denied never becomes established, so any later packet
 // belongs to an allowed one. Judging those again would misread closing sockets,
 // which the kernel re-attributes to UID 0 once the app has closed them. Cached
@@ -71,7 +77,7 @@ func AllowOutboundPacket(packet []byte) bool {
 
 	network, src, srcPort, dst, dstPort, ok := parse5Tuple(packet)
 	if !ok {
-		return true
+		return false
 	}
 	if network == protoTCP {
 		if flags, ok := tcpFlags(packet); ok && flags&tcpFlagSYN == 0 {
@@ -101,6 +107,9 @@ const (
 	tcpOffsetFlags = 13
 	tcpFlagSYN     = 0x02
 
+	ipv4FlagMF         = 0x2000
+	ipv4MaskFragOffset = 0x1fff
+
 	// IP-header field offsets (bytes from the start of the IP packet).
 	ipv4OffsetSrc = 12
 	ipv4OffsetDst = 16
@@ -109,9 +118,8 @@ const (
 )
 
 // parse5Tuple extracts (network, srcIP, srcPort, dstIP, dstPort) from an
-// outbound IPv4/IPv6 packet. ok is false for non-TCP/UDP or malformed packets.
-// IPv6 with extension headers before the L4 header is treated as non-TCP/UDP
-// (ok=false) — a conservative simplification for v1.
+// outbound IPv4/IPv6 packet. ok is false for non-TCP/UDP, fragmented or
+// malformed packets, and for IPv6 with extension headers before the L4 header.
 func parse5Tuple(p []byte) (network string, srcIP net.IP, srcPort int, dstIP net.IP, dstPort int, ok bool) {
 	if len(p) < 1 {
 		return
@@ -124,6 +132,9 @@ func parse5Tuple(p []byte) (network string, srcIP net.IP, srcPort int, dstIP net
 		ihl := int(p[0]&0x0f) * 4
 		if ihl < 20 || len(p) < ihl+4 {
 			return
+		}
+		if frag := int(p[6])<<8 | int(p[7]); frag&(ipv4FlagMF|ipv4MaskFragOffset) != 0 {
+			return // a fragment: only the first one carries ports
 		}
 		network, ok = ipProtoToNetwork(p[9])
 		if !ok {
