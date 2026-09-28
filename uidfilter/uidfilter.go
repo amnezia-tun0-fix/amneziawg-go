@@ -174,10 +174,10 @@ func (g *Gate) AllowOutboundPacket(packet []byte, r Releaser) bool {
 // UDP, else by holding it while the flow is judged.
 func (s *flowState) decide(h *holder, o *ExpOptions, key flowKey, packet []byte, r Releaser, now int64) bool {
 	if key.proto == ipProtoUDP {
-		allow, res := s.cache.lookup(key, now, o.Revalidate)
+		allow, expiresAt, res := s.cache.lookup(key, now, o.Revalidate)
 		switch res {
 		case cacheHit:
-			if allow && o.RefreshAfter > 0 && s.cache.dueForRefresh(key, now, o.RefreshAfter) {
+			if allow && o.RefreshAfter > 0 && now >= expiresAt-cacheTTL.Nanoseconds()+int64(o.RefreshAfter)*int64(time.Second) {
 				return s.refresh(h, key, r, now)
 			}
 			return allow

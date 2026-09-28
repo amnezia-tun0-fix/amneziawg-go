@@ -352,3 +352,23 @@ func TestExpReport(t *testing.T) {
 		t.Error("a report was logged although nothing changed")
 	}
 }
+
+// The cached-UDP hot path under each option that touches it: a verdict well
+// within RefreshAfter, so ra pays only its age check.
+func benchCachedUDPExp(b *testing.B, o ExpOptions) {
+	rd := installExp(b, &switchFilter{}, o)
+	p := ipv4Packet(ipProtoUDP, net.IPv4(10, 0, 0, 2), net.IPv4(1, 1, 1, 1), 5555, 443)
+	if !rd.verdict(b, p) {
+		b.Fatal("unexpected deny")
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !rd.check(p) {
+			b.Fatal("unexpected deny")
+		}
+	}
+}
+
+func BenchmarkExpCachedUDPNone(b *testing.B) { benchCachedUDPExp(b, ExpOptions{}) }
+func BenchmarkExpCachedUDPRv(b *testing.B)   { benchCachedUDPExp(b, ExpOptions{Revalidate: true}) }
+func BenchmarkExpCachedUDPRa2(b *testing.B)  { benchCachedUDPExp(b, ExpOptions{RefreshAfter: 2}) }

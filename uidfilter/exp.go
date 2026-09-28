@@ -433,25 +433,19 @@ const (
 	cacheStale   // an allowed entry expired less than maxHoldTime ago, kept
 )
 
-// dueForRefresh reports whether a valid allowed verdict for k is older than
-// after seconds.
-func (c *decisionCache) dueForRefresh(k flowKey, now int64, after int) bool {
-	e := c.m[k]
-	return now-(e.expiresAt-cacheTTL.Nanoseconds()) >= int64(after)*int64(time.Second)
-}
-
-// lookup is get with the experimental grace period for allowed verdicts.
-func (c *decisionCache) lookup(k flowKey, now int64, keepStale bool) (bool, cacheLookup) {
+// lookup is get with the experimental grace period for allowed verdicts. It
+// also returns when the entry expires, so that its age costs no second lookup.
+func (c *decisionCache) lookup(k flowKey, now int64, keepStale bool) (bool, int64, cacheLookup) {
 	e, ok := c.m[k]
 	if !ok {
-		return false, cacheMiss
+		return false, 0, cacheMiss
 	}
 	if e.expiresAt > now {
-		return e.allow, cacheHit
+		return e.allow, e.expiresAt, cacheHit
 	}
 	if keepStale && e.allow && now-e.expiresAt < maxHoldTime.Nanoseconds() {
-		return true, cacheStale
+		return true, e.expiresAt, cacheStale
 	}
 	delete(c.m, k)
-	return false, cacheExpired
+	return false, 0, cacheExpired
 }
