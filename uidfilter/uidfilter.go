@@ -74,6 +74,9 @@ type holder struct {
 	// writing while the holder is retired, so no packet leaves on a verdict of
 	// a filter that Set has already replaced.
 	release sync.RWMutex
+
+	opts  atomic.Pointer[ExpOptions] // experimental, see exp.go
+	stats expStats
 }
 
 type job struct {
@@ -137,27 +140,51 @@ func (g *Gate) AllowOutboundPacket(packet []byte, r Releaser) bool {
 		g.h, g.s = h, newFlowState()
 	}
 
+	o := h.opts.Load()
+
 	proto, src, srcPort, dst, dstPort, ok := parse5Tuple(packet)
 	if !ok {
-		return false
+		return g.s.unattributable(h, o, packet, r)
 	}
+	synAck := false
 	if proto == ipProtoTCP {
-		if flags, ok := tcpFlags(packet); ok && flags&tcpFlagSYN == 0 {
+		flags, ok := tcpFlags(packet)
+		if ok && flags&tcpFlagSYN == 0 {
 			return true
 		}
+		synAck = ok && flags&tcpFlagACK != 0
 	}
 
 	key := flowKey{proto: proto, ipLen: uint8(len(src)), srcPort: uint16(srcPort), dstPort: uint16(dstPort)}
 	copy(key.srcIP[:], src)
 	copy(key.dstIP[:], dst)
-
-	now := h.now.Load()
-	if proto == ipProtoUDP {
-		if allow, found := g.s.cache.get(key, now); found {
-			return allow
+	if synAck {
+		h.stats.synAck.Add(1)
+		if o.SynAckByListener {
+			// Ask who listens on the source: getConnectionOwnerUid with an
+			// unspecified remote finds the listening socket, not the request
+			// socket, which the kernel reports as uid 0.
+			key.dstIP, key.dstPort = [16]byte{}, 0
 		}
 	}
-	return g.s.hold(h, key, packet, r, now)
+	return g.s.decide(h, o, key, packet, r, h.now.Load())
+}
+
+// decide returns the verdict for a packet of the flow key: from the cache for
+// UDP, else by holding it while the flow is judged.
+func (s *flowState) decide(h *holder, o *ExpOptions, key flowKey, packet []byte, r Releaser, now int64) bool {
+	if key.proto == ipProtoUDP {
+		allow, res := s.cache.lookup(key, now, o.Revalidate)
+		switch res {
+		case cacheHit:
+			return allow
+		case cacheStale:
+			return s.revalidate(h, key, r, now)
+		case cacheExpired:
+			h.stats.expired.Add(1)
+		}
+	}
+	return s.hold(h, o, key, packet, r, now)
 }
 
 const (
@@ -166,6 +193,7 @@ const (
 
 	tcpOffsetFlags = 13
 	tcpFlagSYN     = 0x02
+	tcpFlagACK     = 0x10
 
 	ipv4FlagMF         = 0x2000
 	ipv4MaskFragOffset = 0x1fff
@@ -288,6 +316,8 @@ type flowState struct {
 	waiting   int       // pending flows without a verdict yet
 	heldBytes int       // bytes of the packets held
 	decided   []flowKey // pending flows with a verdict, not yet collected
+
+	frags map[fragKey]fragEntry // experimental, reader-owned: see exp.go
 }
 
 type pendingFlow struct {
@@ -309,8 +339,9 @@ func newHolder(f PacketFilter) *holder {
 		jobs:  make(chan job, maxPendingFlows),
 		done:  make(chan struct{}),
 	}
+	h.loadOpts()
 	go h.tick()
-	for i := 0; i < workers; i++ {
+	for i := 0; i < h.workerCount(); i++ {
 		go h.work()
 	}
 	return h
@@ -320,6 +351,7 @@ func newFlowState() *flowState {
 	return &flowState{
 		cache:   decisionCache{m: make(map[flowKey]cacheEntry)},
 		pending: make(map[flowKey]*pendingFlow),
+		frags:   make(map[fragKey]fragEntry),
 	}
 }
 
@@ -328,13 +360,20 @@ func newFlowState() *flowState {
 func (h *holder) tick() {
 	t := time.NewTicker(clockInterval)
 	defer t.Stop()
-	for {
+	var prev []expCounter
+	lastReport := time.Now()
+	for ticks := 1; ; ticks++ {
 		select {
 		case <-h.done:
 			return
 		case now := <-t.C:
 			if since := int64(now.Sub(h.start)); since > h.now.Load() {
 				h.now.Store(since)
+			}
+			h.loadOpts()
+			if ticks%expReportEvery == 0 {
+				prev = h.report(prev, now.Sub(lastReport))
+				lastReport = now
 			}
 		}
 	}
@@ -343,14 +382,22 @@ func (h *holder) tick() {
 // hold handles a packet whose flow has no cached verdict. It runs on the
 // tun-read goroutine and returns the packet's verdict if the flow has one by
 // now, and false if the packet was held or dropped.
-func (s *flowState) hold(h *holder, key flowKey, packet []byte, r Releaser, now int64) bool {
+func (s *flowState) hold(h *holder, o *ExpOptions, key flowKey, packet []byte, r Releaser, now int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	defer s.collectDecided(now)
+	defer func() {
+		h.stats.pendingNow.Store(int64(len(s.pending)))
+		h.stats.cacheNow.Store(int64(len(s.cache.m)))
+	}()
 
 	if pf, ok := s.pending[key]; ok {
 		if !pf.decided {
-			if len(pf.held) < maxHeldPerFlow && s.heldBytes+len(packet) <= maxHeldBytes {
+			if len(pf.held) >= h.heldPerFlow(o) {
+				h.stats.heldCap.Add(1)
+			} else if s.heldBytes+len(packet) > maxHeldBytes {
+				h.stats.heldBytes.Add(1)
+			} else {
 				pf.held = append(pf.held, heldPacket{append([]byte(nil), packet...), now})
 				s.heldBytes += len(packet)
 			}
@@ -364,16 +411,19 @@ func (s *flowState) hold(h *holder, key flowKey, packet []byte, r Releaser, now 
 		// A SYN is judged afresh: this may be a new connection on the same 5-tuple.
 	}
 	if s.waiting >= maxPendingFlows || s.heldBytes+len(packet) > maxHeldBytes {
+		h.stats.pendingFull.Add(1)
 		return false // not cached: the flow is judged once there is room
 	}
 	select {
 	case h.jobs <- job{s, key}:
 	default:
+		h.stats.jobsFull.Add(1)
 		return false // other Gates keep the workers busy
 	}
 	s.pending[key] = &pendingFlow{held: []heldPacket{{append([]byte(nil), packet...), now}}, r: r}
 	s.waiting++
 	s.heldBytes += len(packet)
+	h.stats.jobs.Add(1)
 	return false
 }
 
@@ -413,9 +463,14 @@ func (h *holder) work() {
 // goroutine sees the verdict only once nothing is held.
 func (h *holder) judge(s *flowState, key flowKey) {
 	srcIP, dstIP := net.IP(key.srcIP[:key.ipLen]).String(), net.IP(key.dstIP[:key.ipLen]).String()
+	t0 := time.Now()
 	allow := h.f.Allow(networkName(key.proto), srcIP, int(key.srcPort), dstIP, int(key.dstPort))
+	took := time.Since(t0)
+	var rounds int64
+	defer func() { h.stats.observe(allow, took, rounds) }()
 
 	for {
+		rounds++
 		s.mu.Lock()
 		pf := s.pending[key]
 		held := pf.held
@@ -452,6 +507,9 @@ func (h *holder) send(r Releaser, held []heldPacket) bool {
 	for _, p := range held {
 		if now-p.at <= maxHoldTime.Nanoseconds() {
 			r.ReleaseOutboundPacket(p.data)
+			h.stats.released.Add(1)
+		} else {
+			h.stats.tooOld.Add(1)
 		}
 	}
 	return true
@@ -511,6 +569,7 @@ func (c *decisionCache) put(k flowKey, allow bool, now int64) {
 // denied entries go first, and allowed ones only while they alone fill more
 // than seven eighths of it. Those are judged again on their next packet.
 func (c *decisionCache) evict(now int64) {
+	expEvictions.Add(1)
 	for k, e := range c.m {
 		if e.expiresAt <= now || !e.allow {
 			delete(c.m, k)
