@@ -177,6 +177,9 @@ func (s *flowState) decide(h *holder, o *ExpOptions, key flowKey, packet []byte,
 		allow, res := s.cache.lookup(key, now, o.Revalidate)
 		switch res {
 		case cacheHit:
+			if allow && o.RefreshAfter > 0 && s.cache.dueForRefresh(key, now, o.RefreshAfter) {
+				return s.refresh(h, key, r, now)
+			}
 			return allow
 		case cacheStale:
 			return s.revalidate(h, key, r, now)

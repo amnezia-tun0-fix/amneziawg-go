@@ -137,6 +137,69 @@ func TestExpRevalidatePendingFull(t *testing.T) {
 	rd.settle(t)
 }
 
+// With RefreshAfter, an allowed flow older than that is judged again while its
+// verdict is still valid: a burst at that moment passes whole, the filter is
+// asked once, and the flow never reaches the expiry that holds its packets.
+func TestExpRefreshKeepsBurst(t *testing.T) {
+	f := &switchFilter{}
+	rd := installExp(t, f, ExpOptions{RefreshAfter: 2})
+	p := udpPacket(5555, net.IPv4(1, 1, 1, 1), 0)
+	if !rd.verdict(t, p) {
+		t.Fatal("expected allow")
+	}
+	advanceClock(time.Second)
+	rd.check(p)
+	if n := f.calls.Load(); n != 1 {
+		t.Fatalf("a verdict younger than RefreshAfter was judged again: %d lookups", n)
+	}
+	gate := f.block()
+	advanceClock(time.Second)
+	for i := 0; i < 20; i++ {
+		if !rd.check(udpPacket(5555, net.IPv4(1, 1, 1, 1), byte(i))) {
+			t.Fatalf("packet %d of an allowed flow was held or dropped while it was judged again", i)
+		}
+	}
+	close(gate)
+	rd.settle(t)
+	if n := f.calls.Load(); n != 2 {
+		t.Errorf("expected one lookup to judge the flow again, got %d in all", n)
+	}
+	// Past the first verdict's expiry the flow still passes at once: it was renewed.
+	for i := 0; i < 5; i++ {
+		advanceClock(2 * time.Second)
+		if !rd.check(p) {
+			t.Fatalf("an allowed flow was held %d s after its first lookup", 2+2*(i+1))
+		}
+		rd.settle(t)
+	}
+	if n := current.Load().stats.expired.Load(); n != 0 {
+		t.Errorf("an active flow reached expiry %d times", n)
+	}
+}
+
+// A socket that takes over the 5-tuple of an allowed flow is denied RefreshAfter
+// after the lookup it inherits, not cacheTTL.
+func TestExpRefreshCatchesTakeover(t *testing.T) {
+	f := &switchFilter{}
+	rd := installExp(t, f, ExpOptions{RefreshAfter: 2})
+	p := udpPacket(5555, net.IPv4(1, 1, 1, 1), 0)
+	if !rd.verdict(t, p) {
+		t.Fatal("expected allow")
+	}
+	f.deny.Store(true) // the allowed socket closed, another one took the 5-tuple
+	advanceClock(2 * time.Second)
+	if !rd.check(p) {
+		t.Fatal("expected the valid verdict to pass the packet that starts the lookup")
+	}
+	rd.settle(t)
+	if rd.check(p) {
+		t.Error("a packet passed after the refresh denied the flow")
+	}
+	if n := current.Load().stats.refreshDeny.Load(); n != 1 {
+		t.Errorf("expected the refresh to deny once, got %d", n)
+	}
+}
+
 // With SynAckByListener, a SYN-ACK is judged by who listens on its source.
 func TestExpSynAckByListener(t *testing.T) {
 	f := &switchFilter{}
@@ -259,12 +322,12 @@ func TestExpWorkers(t *testing.T) {
 }
 
 func TestParseExpOptions(t *testing.T) {
-	o := ParseExpOptions("rv, sa,icmp,frag,w8,h32,bogus")
-	want := ExpOptions{Revalidate: true, SynAckByListener: true, KernelICMP: true, Fragments: true, Workers: 8, HeldPerFlow: 32}
+	o := ParseExpOptions("rv, ra2,sa,icmp,frag,w8,h32,bogus")
+	want := ExpOptions{Revalidate: true, RefreshAfter: 2, SynAckByListener: true, KernelICMP: true, Fragments: true, Workers: 8, HeldPerFlow: 32}
 	if o != want {
 		t.Errorf("got %+v", o)
 	}
-	if s := o.String(); s != "rv,sa,icmp,frag,w8,h32" {
+	if s := o.String(); s != "rv,ra2,sa,icmp,frag,w8,h32" {
 		t.Errorf("String: %s", s)
 	}
 	if (ExpOptions{}).String() != "none" || ParseExpOptions("") != (ExpOptions{}) {

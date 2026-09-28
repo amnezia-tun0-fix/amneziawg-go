@@ -18,6 +18,7 @@ import (
 // ExpOptions switch experimental behaviour.
 type ExpOptions struct {
 	Revalidate       bool // UDP: pass on an expired allowed verdict while the flow is judged again
+	RefreshAfter     int  // UDP: seconds after which a valid allowed verdict is judged again in the background; 0 = never
 	SynAckByListener bool // judge a SYN-ACK by the owner of its listening socket
 	KernelICMP       bool // pass ICMP that an unprivileged socket cannot send
 	Fragments        bool // judge IPv4 fragments by their first fragment
@@ -29,6 +30,9 @@ func (o ExpOptions) String() string {
 	var s []string
 	if o.Revalidate {
 		s = append(s, "rv")
+	}
+	if o.RefreshAfter > 0 {
+		s = append(s, fmt.Sprintf("ra%d", o.RefreshAfter))
 	}
 	if o.SynAckByListener {
 		s = append(s, "sa")
@@ -51,7 +55,7 @@ func (o ExpOptions) String() string {
 	return strings.Join(s, ",")
 }
 
-// ParseExpOptions reads a comma-separated list: rv, sa, icmp, frag, wN, hN.
+// ParseExpOptions reads a comma-separated list: rv, raN, sa, icmp, frag, wN, hN.
 func ParseExpOptions(v string) ExpOptions {
 	var o ExpOptions
 	for _, f := range strings.Split(v, ",") {
@@ -59,6 +63,8 @@ func ParseExpOptions(v string) ExpOptions {
 		switch {
 		case f == "rv":
 			o.Revalidate = true
+		case strings.HasPrefix(f, "ra"):
+			fmt.Sscanf(f[2:], "%d", &o.RefreshAfter)
 		case f == "sa":
 			o.SynAckByListener = true
 		case f == "icmp":
@@ -139,6 +145,7 @@ type expStats struct {
 	unattr                                                  [unattrKinds]atomic.Int64
 	kernelICMP, synAck                                      atomic.Int64
 	revalStart, revalPass, revalDeny, expired               atomic.Int64
+	refreshStart, refreshPass, refreshDeny                  atomic.Int64
 	fragFirst, fragFollow, fragOrphan                       atomic.Int64
 	lat                                                     [2][latBuckets]atomic.Int64 // [deny, allow]
 	latMax                                                  [2]atomic.Int64
@@ -188,6 +195,7 @@ func (s *expStats) snapshot() []expCounter {
 		{"kernel_icmp_passed", s.kernelICMP.Load()}, {"synack_judged", s.synAck.Load()},
 		{"udp_expired_rejudged", s.expired.Load()},
 		{"reval_started", s.revalStart.Load()}, {"reval_allow", s.revalPass.Load()}, {"reval_deny", s.revalDeny.Load()},
+		{"refresh_started", s.refreshStart.Load()}, {"refresh_allow", s.refreshPass.Load()}, {"refresh_deny", s.refreshDeny.Load()},
 		{"frag_first", s.fragFirst.Load()}, {"frag_followed", s.fragFollow.Load()}, {"frag_orphan", s.fragOrphan.Load()},
 		{"cache_evictions", expEvictions.Load()},
 	}
@@ -371,6 +379,22 @@ func (s *flowState) fragment(h *holder, o *ExpOptions, p []byte, r Releaser) boo
 // judged again unless it already is; the new verdict replaces the old one when
 // the reader next sees the flow. Past maxHoldTime the flow goes back to hold.
 func (s *flowState) revalidate(h *holder, key flowKey, r Releaser, now int64) bool {
+	return s.rejudge(h, key, r, now, &h.stats.revalStart, &h.stats.revalPass, &h.stats.revalDeny)
+}
+
+// refresh handles a packet of a UDP flow whose allowed verdict is still valid but
+// older than RefreshAfter: it passes, as it would anyway, and the flow is judged
+// again in the background. No packet waits and none passes on a verdict older
+// than cacheTTL, and a socket that took over the 5-tuple of an allowed flow is
+// denied about RefreshAfter after the lookup it inherited, not cacheTTL.
+func (s *flowState) refresh(h *holder, key flowKey, r Releaser, now int64) bool {
+	return s.rejudge(h, key, r, now, &h.stats.refreshStart, &h.stats.refreshPass, &h.stats.refreshDeny)
+}
+
+// rejudge passes a packet on its flow's old verdict and judges the flow again
+// unless it already is; the new verdict replaces the old one when the reader
+// next sees the flow.
+func (s *flowState) rejudge(h *holder, key flowKey, r Releaser, now int64, started, pass, deny *atomic.Int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if pf, ok := s.pending[key]; ok {
@@ -380,9 +404,9 @@ func (s *flowState) revalidate(h *holder, key flowKey, r Releaser, now int64) bo
 		delete(s.pending, key)
 		s.cache.put(key, pf.allow, now)
 		if pf.allow {
-			h.stats.revalPass.Add(1)
+			pass.Add(1)
 		} else {
-			h.stats.revalDeny.Add(1)
+			deny.Add(1)
 		}
 		return pf.allow
 	}
@@ -396,7 +420,7 @@ func (s *flowState) revalidate(h *holder, key flowKey, r Releaser, now int64) bo
 	}
 	s.pending[key] = &pendingFlow{r: r}
 	s.waiting++
-	h.stats.revalStart.Add(1)
+	started.Add(1)
 	return true
 }
 
@@ -408,6 +432,13 @@ const (
 	cacheExpired // an expired entry, now deleted
 	cacheStale   // an allowed entry expired less than maxHoldTime ago, kept
 )
+
+// dueForRefresh reports whether a valid allowed verdict for k is older than
+// after seconds.
+func (c *decisionCache) dueForRefresh(k flowKey, now int64, after int) bool {
+	e := c.m[k]
+	return now-(e.expiresAt-cacheTTL.Nanoseconds()) >= int64(after)*int64(time.Second)
+}
 
 // lookup is get with the experimental grace period for allowed verdicts.
 func (c *decisionCache) lookup(k flowKey, now int64, keepStale bool) (bool, cacheLookup) {
