@@ -74,6 +74,9 @@ type holder struct {
 	// writing while the holder is retired, so no packet leaves on a verdict of
 	// a filter that Set has already replaced.
 	release sync.RWMutex
+
+	opts  atomic.Pointer[ExpOptions] // experimental, see exp.go
+	stats expStats
 }
 
 type job struct {
@@ -140,7 +143,7 @@ func (g *Gate) AllowOutboundPacket(packet []byte, r Releaser) bool {
 
 	proto, src, srcPort, dst, dstPort, ok := parse5Tuple(packet)
 	if !ok {
-		return g.s.fragment(h, packet, r)
+		return g.s.unattributable(h, packet, r)
 	}
 	synAck := false
 	if proto == ipProtoTCP {
@@ -156,6 +159,7 @@ func (g *Gate) AllowOutboundPacket(packet []byte, r Releaser) bool {
 	if !synAck {
 		copy(key.dstIP[:], dst)
 	} else {
+		h.stats.synAck.Add(1)
 		// A SYN-ACK answers a connection that came in through the tunnel. Its
 		// 5-tuple belongs to a request socket, which the kernel reports as
 		// owned by uid 0, so ask about the socket listening on the source
@@ -341,8 +345,9 @@ func newHolder(f PacketFilter) *holder {
 		jobs:  make(chan job, maxPendingFlows),
 		done:  make(chan struct{}),
 	}
+	h.loadOpts()
 	go h.tick()
-	for i := 0; i < workers; i++ {
+	for i := 0; i < h.workerCount(); i++ {
 		go h.work()
 	}
 	return h
@@ -361,13 +366,20 @@ func newFlowState() *flowState {
 func (h *holder) tick() {
 	t := time.NewTicker(clockInterval)
 	defer t.Stop()
-	for {
+	var prev []expCounter
+	lastReport := time.Now()
+	for ticks := 1; ; ticks++ {
 		select {
 		case <-h.done:
 			return
 		case now := <-t.C:
 			if since := int64(now.Sub(h.start)); since > h.now.Load() {
 				h.now.Store(since)
+			}
+			h.loadOpts()
+			if ticks%expReportEvery == 0 {
+				prev = h.report(prev, now.Sub(lastReport))
+				lastReport = now
 			}
 		}
 	}
@@ -380,10 +392,18 @@ func (s *flowState) hold(h *holder, key flowKey, packet []byte, r Releaser, now 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	defer s.collectDecided(now)
+	defer func() {
+		h.stats.pendingNow.Store(int64(len(s.pending)))
+		h.stats.cacheNow.Store(int64(len(s.cache.m)))
+	}()
 
 	if pf, ok := s.pending[key]; ok {
 		if !pf.decided {
-			if len(pf.held) < maxHeldPerFlow && s.heldBytes+len(packet) <= maxHeldBytes {
+			if len(pf.held) >= h.heldPerFlow() {
+				h.stats.heldCap.Add(1)
+			} else if s.heldBytes+len(packet) > maxHeldBytes {
+				h.stats.heldBytes.Add(1)
+			} else {
 				pf.held = append(pf.held, heldPacket{append([]byte(nil), packet...), now})
 				s.heldBytes += len(packet)
 			}
@@ -398,13 +418,16 @@ func (s *flowState) hold(h *holder, key flowKey, packet []byte, r Releaser, now 
 		// So is a flow whose verdict waited too long to be collected.
 	}
 	if s.waiting >= maxPendingFlows || s.heldBytes+len(packet) > maxHeldBytes {
+		h.stats.pendingFull.Add(1)
 		return false // not cached: the flow is judged once there is room
 	}
 	select {
 	case h.jobs <- job{s, key}:
 	default:
+		h.stats.jobsFull.Add(1)
 		return false // other Gates keep the workers busy
 	}
+	h.stats.jobs.Add(1)
 	s.pending[key] = &pendingFlow{held: []heldPacket{{append([]byte(nil), packet...), now}}, r: r}
 	s.waiting++
 	s.heldBytes += len(packet)
@@ -454,9 +477,13 @@ func (h *holder) work() {
 // goroutine sees the verdict only once nothing is held.
 func (h *holder) judge(s *flowState, key flowKey) {
 	srcIP, dstIP := net.IP(key.srcIP[:key.ipLen]).String(), net.IP(key.dstIP[:key.ipLen]).String()
+	t0 := time.Now()
 	allow := h.f.Allow(networkName(key.proto), srcIP, int(key.srcPort), dstIP, int(key.dstPort))
+	took, rounds := time.Since(t0), int64(0)
+	defer func() { h.stats.observe(allow, took, rounds) }()
 
 	for {
+		rounds++
 		s.mu.Lock()
 		pf := s.pending[key]
 		held := pf.held
@@ -493,6 +520,9 @@ func (h *holder) send(r Releaser, held []heldPacket) bool {
 	for _, p := range held {
 		if now-p.at <= maxHoldTime.Nanoseconds() {
 			r.ReleaseOutboundPacket(p.data)
+			h.stats.released.Add(1)
+		} else {
+			h.stats.tooOld.Add(1)
 		}
 	}
 	return true
@@ -514,6 +544,11 @@ func (s *flowState) refresh(h *holder, key flowKey, r Releaser, now int64) bool 
 		}
 		delete(s.pending, key)
 		s.cache.put(key, pf.allow, pf.at)
+		if pf.allow {
+			h.stats.refreshPass.Add(1)
+		} else {
+			h.stats.refreshDeny.Add(1)
+		}
 		if !pf.allow || !pf.stale(now) {
 			return pf.allow
 		}
@@ -526,6 +561,7 @@ func (s *flowState) refresh(h *holder, key flowKey, r Releaser, now int64) bool 
 	default:
 		return true
 	}
+	h.stats.refreshStart.Add(1)
 	s.pending[key] = &pendingFlow{r: r}
 	s.waiting++
 	return true
@@ -574,8 +610,10 @@ func (s *flowState) fragment(h *holder, p []byte, r Releaser) bool {
 	if frag&ipv4MaskFragOffset != 0 {
 		e, ok := s.frags[fk]
 		if !ok || now-e.at > maxHoldTime.Nanoseconds() {
+			h.stats.fragOrphan.Add(1)
 			return false
 		}
+		h.stats.fragFollow.Add(1)
 		if e.pass {
 			return true
 		}
@@ -595,6 +633,7 @@ func (s *flowState) fragment(h *holder, p []byte, r Releaser) bool {
 		s.evictFrags(now)
 	}
 	s.frags[fk] = fragEntry{key: key, pass: pass, at: now}
+	h.stats.fragFirst.Add(1)
 	if pass {
 		return true
 	}
@@ -681,6 +720,7 @@ func (c *decisionCache) put(k flowKey, allow bool, now int64) {
 // denied entries go first, and allowed ones only while they alone fill more
 // than seven eighths of it. Those are judged again on their next packet.
 func (c *decisionCache) evict(now int64) {
+	expEvictions.Add(1)
 	for k, e := range c.m {
 		if e.expiresAt <= now || !e.allow {
 			delete(c.m, k)
