@@ -77,6 +77,7 @@ type holder struct {
 
 	opts  atomic.Pointer[ExpOptions] // experimental, see exp.go
 	stats expStats
+	cache CacheMode // experimental: the verdict cache, taken when installed
 }
 
 type job struct {
@@ -139,6 +140,7 @@ func (g *Gate) AllowOutboundPacket(packet []byte, r Releaser) bool {
 	}
 	if g.h != h {
 		g.h, g.s = h, newFlowState()
+		g.s.expInit(h)
 	}
 
 	proto, src, srcPort, dst, dstPort, ok := parse5Tuple(packet)
@@ -149,7 +151,10 @@ func (g *Gate) AllowOutboundPacket(packet []byte, r Releaser) bool {
 	if proto == ipProtoTCP {
 		flags, ok := tcpFlags(packet)
 		if ok && flags&tcpFlagSYN == 0 {
-			return true
+			if h.cache != CacheF174 {
+				return true
+			}
+			ok = false // lab: #174 judges every TCP packet by its 5-tuple
 		}
 		synAck = ok && flags&tcpFlagACK != 0
 	}
@@ -174,6 +179,9 @@ func (g *Gate) AllowOutboundPacket(packet []byte, r Releaser) bool {
 // decide returns the verdict for a packet of the flow key: from the cache for
 // UDP, else by holding the packet while the flow is judged.
 func (s *flowState) decide(h *holder, key flowKey, packet []byte, r Releaser, now int64) bool {
+	if s.exp != nil {
+		return s.expDecide(h, key, packet, r, now)
+	}
 	if key.proto == ipProtoUDP {
 		if allow, due, found := s.cache.get(key, now); found {
 			if allow && due {
@@ -316,6 +324,8 @@ type flowState struct {
 	decided   []flowKey // pending flows with a verdict, not yet collected
 
 	frags map[fragKey]fragEntry // fragmented datagrams followed; the reader's own
+
+	exp *expCache // experimental: a cache other than the release one; nil for it
 }
 
 type pendingFlow struct {
@@ -346,6 +356,7 @@ func newHolder(f PacketFilter) *holder {
 		done:  make(chan struct{}),
 	}
 	h.loadOpts()
+	h.cache = h.expOpts().CacheMode
 	go h.tick()
 	for i := 0; i < h.workerCount(); i++ {
 		go h.work()
@@ -395,6 +406,9 @@ func (s *flowState) hold(h *holder, key flowKey, packet []byte, r Releaser, now 
 	defer func() {
 		h.stats.pendingNow.Store(int64(len(s.pending)))
 		h.stats.cacheNow.Store(int64(len(s.cache.m)))
+		if h.stats.snapWant.Load() {
+			s.expSnapshot(h, now)
+		}
 	}()
 
 	if pf, ok := s.pending[key]; ok {
@@ -410,6 +424,9 @@ func (s *flowState) hold(h *holder, key flowKey, packet []byte, r Releaser, now 
 			return false
 		}
 		delete(s.pending, key)
+		if s.exp != nil && s.exp.store(key, pf.allow, pf.at) {
+			return pf.allow
+		}
 		if key.proto != ipProtoTCP && !pf.stale(now) {
 			s.cache.put(key, pf.allow, pf.at)
 			return pf.allow
@@ -443,6 +460,9 @@ func (s *flowState) collectDecided(now int64) {
 	for _, key := range s.decided {
 		if pf, ok := s.pending[key]; ok && pf.decided {
 			delete(s.pending, key)
+			if s.exp != nil && s.exp.store(key, pf.allow, pf.at) {
+				continue
+			}
 			if key.proto != ipProtoTCP {
 				s.cache.put(key, pf.allow, pf.at)
 			}
