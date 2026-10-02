@@ -277,14 +277,19 @@ func TestExpFloodAgainstAllowedFlow(t *testing.T) {
 	}
 }
 
-// cached reports whether rd's cache holds a verdict for the UDP flow of p. It
-// reads the cache directly: a check would depend on the real clock, which a
-// slow run under -race can move past refreshAfter.
-func cached(rd *reader, p []byte) bool {
+func udpKey(p []byte) flowKey {
 	_, src, srcPort, dst, dstPort, _ := parse5Tuple(p)
 	k := flowKey{proto: ipProtoUDP, ipLen: net.IPv4len, srcPort: uint16(srcPort), dstPort: uint16(dstPort)}
 	copy(k.srcIP[:], src)
 	copy(k.dstIP[:], dst)
+	return k
+}
+
+// cached reports whether rd's cache holds a verdict for the UDP flow of p. It
+// reads the cache directly: a check would depend on the real clock, which a
+// slow run under -race can move past refreshAfter.
+func cached(rd *reader, p []byte) bool {
+	k := udpKey(p)
 	if s := rd.g.s; s.exp != nil && s.exp.isFIFO() {
 		_, ok := s.exp.fifo.m[k]
 		return ok
@@ -399,6 +404,12 @@ func BenchmarkExpCachedUDP(b *testing.B) {
 					for _, p := range pkts {
 						if !rd.check(p) {
 							b.Fatal("unexpected deny")
+						}
+						// The holder's clock follows the real one: stamp the
+						// verdict an hour ahead, so that no mode reaches its
+						// refresh or expiry while the hit path is measured.
+						if s := rd.g.s; s.exp == nil || !s.exp.isFIFO() {
+							s.cache.put(udpKey(p), true, current.Load().now.Load()+int64(time.Hour))
 						}
 					}
 					b.ReportAllocs()
