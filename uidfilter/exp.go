@@ -17,9 +17,9 @@ import (
 
 // ExpOptions switch experimental behaviour.
 type ExpOptions struct {
-	KernelICMP  bool // pass ICMP that an unprivileged socket cannot send
-	Workers     int  // filter calls at once, taken when a filter is installed; 0 means workers
-	HeldPerFlow int  // packets held per flow; 0 means maxHeldPerFlow
+	KernelICMP  bool      // pass ICMP that an unprivileged socket cannot send
+	Workers     int       // filter calls at once, taken when a filter is installed; 0 means workers
+	HeldPerFlow int       // packets held per flow; 0 means maxHeldPerFlow
 	CacheMode   CacheMode // the verdict cache, taken when a filter is installed
 }
 

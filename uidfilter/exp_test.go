@@ -169,10 +169,10 @@ func sendEvery(t *testing.T, rd *reader, p []byte, step, d time.Duration) time.D
 func TestExpTakeoverWindow(t *testing.T) {
 	const step = 100 * time.Millisecond
 	want := map[CacheMode][2]time.Duration{ // fresh, active; -1 for "never closes"
-		CachePR:        {2 * time.Second, 1200 * time.Millisecond},
+		CachePR:        {2 * time.Second, time.Second},
 		CacheFIFO:      {-1, -1},
 		CacheNoRefresh: {9900 * time.Millisecond, 4900 * time.Millisecond},
-		CacheHold:      {1900 * time.Millisecond, 1100 * time.Millisecond},
+		CacheHold:      {1900 * time.Millisecond, 900 * time.Millisecond},
 		CacheF174:      {-1, -1},
 	}
 	for _, m := range allModes {
@@ -201,11 +201,10 @@ func TestExpTakeoverWindow(t *testing.T) {
 	}
 }
 
-// A verdict the workers reached is applied when the reader next sees its flow,
-// however late, and the cache then counts its age from that moment. On a
-// quiet tunnel nothing else collects it, so a socket that takes over the
-// 5-tuple a minute later passes on a minute-old lookup, for refreshAfter more.
-// Both the first verdict of a flow and a refreshed one behave so.
+// A verdict the workers reached and nothing collected for a minute (a quiet
+// tunnel): a socket that takes over the 5-tuple then passes nothing. Before
+// G26 was fixed it passed for refreshAfter on the minute-old lookup. Both the
+// first verdict of a flow and a refreshed one.
 func TestExpLateCollectedVerdict(t *testing.T) {
 	const step = 100 * time.Millisecond
 	for _, refreshed := range []bool{false, true} {
@@ -226,8 +225,8 @@ func TestExpLateCollectedVerdict(t *testing.T) {
 		advanceClock(time.Minute)
 		last := sendEvery(t, rd, p, step, 10*time.Second)
 		t.Logf("refreshed=%v: the last packet of a takeover a minute after the lookup passed at %v", refreshed, last)
-		if last != refreshAfter {
-			t.Errorf("refreshed=%v: last packet of the takeover passed at %v, want %v", refreshed, last, refreshAfter)
+		if last >= 0 {
+			t.Errorf("refreshed=%v: the takeover passed until %v", refreshed, last)
 		}
 	}
 }
@@ -321,7 +320,7 @@ func TestExpF174TCP(t *testing.T) {
 		rd := installMode(t, f, m)
 		syn := tcpPacket(5555, tcpFlagSYN)
 		rd.check(syn)
-		rd.settle(t) // allowed
+		rd.settle(t)         // allowed
 		f.denySrcPort = 5555 // a new socket of a denied app on the same 5-tuple
 		for i := 0; i < 2; i++ {
 			passed := rd.check(syn)
@@ -353,7 +352,7 @@ func TestExpCacheSnapshot(t *testing.T) {
 		advanceClock(3 * time.Second)
 		rd.verdict(t, udpPacket(4444, net.IPv4(1, 1, 1, 1), 0))
 		h := current.Load()
-		prev := h.report(nil, time.Second)                // asks for a snapshot
+		prev := h.report(nil, time.Second)                 // asks for a snapshot
 		rd.check(udpPacket(7777, net.IPv4(1, 1, 1, 1), 0)) // a new flow: the reader takes it
 		h.report(prev, time.Second)
 		var snap string
