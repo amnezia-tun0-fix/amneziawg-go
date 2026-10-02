@@ -334,9 +334,13 @@ const (
 	// as in amneziawg-go#174: a SYN on a 5-tuple seen before takes its verdict,
 	// and a packet of a connection whose verdict was evicted is judged again.
 	CacheF174
+	// CachePR2 is CachePR with a full cache evicting denied verdicts only down
+	// to seven eighths of it, not all of them: it keeps as many denials as the
+	// FIFO, which answer the repeated 5-tuples of a flood without a lookup.
+	CachePR2
 )
 
-var cacheModeNames = [...]string{"pr", "fifo", "noref", "hold", "f174"}
+var cacheModeNames = [...]string{"pr", "fifo", "noref", "hold", "f174", "pr2"}
 
 func (m CacheMode) String() string {
 	if int(m) < len(cacheModeNames) {
@@ -368,6 +372,7 @@ func (s *flowState) expInit(h *holder) {
 		return
 	}
 	s.exp = &expCache{mode: h.cache}
+	s.cache.partial = h.cache == CachePR2
 	if s.exp.isFIFO() {
 		s.exp.fifo = fifoCache{
 			m:     make(map[flowKey]bool, cacheMaxEntries),
@@ -382,6 +387,15 @@ func (e *expCache) isFIFO() bool { return e.mode == CacheFIFO || e.mode == Cache
 // expDecide is decide for the modes other than CachePR.
 func (s *flowState) expDecide(h *holder, key flowKey, packet []byte, r Releaser, now int64) bool {
 	switch s.exp.mode {
+	case CachePR2: // the release decide; only the eviction differs
+		if key.proto == ipProtoUDP {
+			if allow, due, found := s.cache.get(key, now); found {
+				if allow && due {
+					return s.refresh(h, key, r, now)
+				}
+				return allow
+			}
+		}
 	case CacheNoRefresh:
 		if key.proto == ipProtoUDP {
 			if allow, _, found := s.cache.get(key, now); found {
@@ -544,4 +558,30 @@ func (c *cacheSnap) String() string {
 	return fmt.Sprintf("mode=%s allow=%d deny=%d tcp=%d dead=%d age_allow=%s age_deny=%s oldest_allow=%ds port_allow=%s",
 		c.mode, c.allow, c.deny, c.tcp, c.dead, joinInts(c.ageAllow[:]), joinInts(c.ageDeny[:]),
 		c.oldestAllow, strings.Join(ports, ","))
+}
+
+// evictPartial makes room in a full cache like evict, expired entries first,
+// but removes denied verdicts only until seven eighths of it are left, and
+// allowed ones after them only if that is not enough.
+func (c *decisionCache) evictPartial(now int64) {
+	const target = cacheMaxEntries - cacheMaxEntries/8
+	for k, e := range c.m {
+		if e.expiresAt <= now {
+			delete(c.m, k)
+		}
+	}
+	for k, e := range c.m {
+		if len(c.m) <= target {
+			return
+		}
+		if !e.allow {
+			delete(c.m, k)
+		}
+	}
+	for k := range c.m {
+		if len(c.m) <= target {
+			return
+		}
+		delete(c.m, k)
+	}
 }

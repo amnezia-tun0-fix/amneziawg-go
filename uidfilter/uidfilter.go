@@ -712,6 +712,8 @@ type cacheEntry struct {
 // guarded. Times come from the holder's coarse clock.
 type decisionCache struct {
 	m map[flowKey]cacheEntry
+
+	partial bool // experimental: evict denied verdicts only down to 7/8, see exp.go
 }
 
 // get returns the cached verdict for k, and whether it is older than
@@ -741,6 +743,10 @@ func (c *decisionCache) put(k flowKey, allow bool, now int64) {
 // than seven eighths of it. Those are judged again on their next packet.
 func (c *decisionCache) evict(now int64) {
 	expEvictions.Add(1)
+	if c.partial {
+		c.evictPartial(now)
+		return
+	}
 	for k, e := range c.m {
 		if e.expiresAt <= now || !e.allow {
 			delete(c.m, k)

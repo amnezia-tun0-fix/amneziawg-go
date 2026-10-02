@@ -139,7 +139,7 @@ func TestExpReport(t *testing.T) {
 
 // --- verdict cache variants ---
 
-var allModes = []CacheMode{CachePR, CacheFIFO, CacheNoRefresh, CacheHold, CacheF174}
+var allModes = []CacheMode{CachePR, CacheFIFO, CacheNoRefresh, CacheHold, CacheF174, CachePR2}
 
 func installMode(t testing.TB, f PacketFilter, m CacheMode) *reader {
 	return installExp(t, f, ExpOptions{CacheMode: m})
@@ -174,6 +174,7 @@ func TestExpTakeoverWindow(t *testing.T) {
 		CacheNoRefresh: {9900 * time.Millisecond, 4900 * time.Millisecond},
 		CacheHold:      {1900 * time.Millisecond, 900 * time.Millisecond},
 		CacheF174:      {-1, -1},
+		CachePR2:       {2 * time.Second, time.Second},
 	}
 	for _, m := range allModes {
 		for i, active := range []time.Duration{0, 5 * time.Second} {
@@ -252,7 +253,7 @@ func TestExpVerdictCollectedByOtherFlow(t *testing.T) {
 // verdict of an allowed flow judged before it: kept, or pushed out and judged
 // again, with its packets held meanwhile.
 func TestExpFloodAgainstAllowedFlow(t *testing.T) {
-	keeps := map[CacheMode]bool{CachePR: true, CacheNoRefresh: true, CacheHold: true}
+	keeps := map[CacheMode]bool{CachePR: true, CacheNoRefresh: true, CacheHold: true, CachePR2: true}
 	for _, m := range allModes {
 		f := &countingFilter{denyDstIP: "2.2.2.2"}
 		rd := installMode(t, f, m)
@@ -447,7 +448,7 @@ func BenchmarkExpEstablishedTCP(b *testing.B) {
 // each packet misses and its verdict is stored. The release cache evicts
 // when full; the FIFO drops its oldest key.
 func BenchmarkExpCacheFlood(b *testing.B) {
-	for _, m := range []CacheMode{CachePR, CacheFIFO} {
+	for _, m := range []CacheMode{CachePR, CacheFIFO, CachePR2} {
 		b.Run(m.String(), func(b *testing.B) {
 			rd := installMode(b, &countingFilter{denySrcPort: -1}, m)
 			rd.verdict(b, udpPacket(5555, net.IPv4(1, 1, 1, 1), 0))
@@ -456,7 +457,7 @@ func BenchmarkExpCacheFlood(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				k := cacheKey(i+100000, ipProtoUDP)
-				if s.exp != nil {
+				if s.exp != nil && s.exp.isFIFO() {
 					if _, ok := s.exp.fifo.m[k]; !ok {
 						s.exp.fifo.put(k, false, 0)
 					}
@@ -465,5 +466,45 @@ func BenchmarkExpCacheFlood(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// After a flood of denied flows a full cache keeps how many denials? The
+// release cache drops them all whenever it is full; pr2 and the FIFO keep most,
+// and pr2 still keeps the allowed verdict.
+func TestExpEvictionKeepsDenials(t *testing.T) {
+	for _, m := range []CacheMode{CachePR, CachePR2, CacheFIFO} {
+		rd := installMode(t, &countingFilter{denyDstIP: "2.2.2.2"}, m)
+		allowed := udpPacket(5555, net.IPv4(1, 1, 1, 1), 0)
+		rd.verdict(t, allowed)
+		for i := 0; i < cacheMaxEntries+100; i++ {
+			rd.check(udpPacket(10000+i, net.IPv4(2, 2, 2, 2), 0))
+			if i%200 == 199 {
+				rd.settle(t)
+			}
+		}
+		rd.settle(t)
+		rd.check(udpPacket(9999, net.IPv4(2, 2, 2, 2), 0)) // collects the last verdicts
+		denials := 0
+		if s := rd.g.s; s.exp != nil && s.exp.isFIFO() {
+			for _, allow := range s.exp.fifo.m {
+				if !allow {
+					denials++
+				}
+			}
+		} else {
+			for _, e := range s.cache.m {
+				if !e.allow {
+					denials++
+				}
+			}
+		}
+		t.Logf("%-4s keeps %d denials after %d denied flows", m, denials, cacheMaxEntries+100)
+		if wantMany := m != CachePR; (denials > cacheMaxEntries/2) != wantMany {
+			t.Errorf("%s: %d denials kept", m, denials)
+		}
+		if m == CachePR2 && !cached(rd, allowed) {
+			t.Error("pr2: the allowed verdict was evicted")
+		}
 	}
 }
