@@ -443,3 +443,28 @@ func BenchmarkExpEstablishedTCP(b *testing.B) {
 		})
 	}
 }
+
+// A flood of new denied flows against the cache alone: every key is new, so
+// each packet misses and its verdict is stored. The release cache evicts
+// when full; the FIFO drops its oldest key.
+func BenchmarkExpCacheFlood(b *testing.B) {
+	for _, m := range []CacheMode{CachePR, CacheFIFO} {
+		b.Run(m.String(), func(b *testing.B) {
+			rd := installMode(b, &countingFilter{denySrcPort: -1}, m)
+			rd.verdict(b, udpPacket(5555, net.IPv4(1, 1, 1, 1), 0))
+			s := rd.g.s
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				k := cacheKey(i+100000, ipProtoUDP)
+				if s.exp != nil {
+					if _, ok := s.exp.fifo.m[k]; !ok {
+						s.exp.fifo.put(k, false, 0)
+					}
+				} else if _, _, ok := s.cache.get(k, 0); !ok {
+					s.cache.put(k, false, 0)
+				}
+			}
+		})
+	}
+}
